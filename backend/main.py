@@ -1,56 +1,69 @@
 from __future__ import annotations
 
-import logging
-from typing import List
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import Settings, get_settings
-from app.db import Database
-from app.routes.auth import router as auth_router
-from app.routes.internal import router as internal_router
-from app.services.auth_service import AuthService
-
-logger = logging.getLogger(__name__)
-
-settings: Settings = get_settings()
-database = Database(settings.database_path, pool_size=settings.database_pool_size)
-auth_service = AuthService(settings, database)
+from app import AppConfig, load_config
+from app.container import AppContainer
+from app.routers import auth, graph, secured
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title=settings.app_name)
-    origins: List[str] = settings.allowed_origins()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+def _resolve_config_path() -> Path:
+    candidate = os.environ.get("APP_CONFIG_PATH")
+    if candidate:
+        return Path(candidate)
+    return Path(__file__).resolve().parent / "config.yaml"
 
-    @app.on_event("startup")
-    async def on_startup() -> None:
-        database.initialize()
 
-    app.include_router(auth_router)
-    app.include_router(internal_router)
+def create_application() -> FastAPI:
+    config_path = _resolve_config_path()
+    config: AppConfig = load_config(config_path)
+    container = AppContainer.build(config)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await container.startup(app)
+        try:
+            yield
+        finally:
+            await container.shutdown(app)
+
+    app = FastAPI(title="Auth BFF", version="0.1.0", lifespan=lifespan)
+
+    if config.server.cors_allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.server.cors_allowed_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    app.include_router(auth.router)
+    app.include_router(graph.router)
+    app.include_router(secured.router)
+
+    @app.get("/")
+    async def root():
+        return {
+            "name": "Auth BFF",
+            "ui": {
+                "authenticated": config.ui.default_authenticated_route,
+                "loggedOut": config.ui.default_logged_out_route,
+            },
+        }
+
     return app
 
 
-def get_auth_service_instance() -> AuthService:
-    return auth_service
-
-
-app = create_app()
-
-
-def main() -> None:
-    import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+app = create_application()
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

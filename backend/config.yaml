@@ -1,0 +1,50 @@
+azure:
+  tenant_id: "your-tenant-id"
+  client_id: "your-client-id"
+  authority_url: "https://login.microsoftonline.com/your-tenant-id"
+  client_secret: "your-client-secret"
+  client_certificate_path: null
+  client_certificate_thumbprint: null
+  redirect_uri: "http://localhost:8000/auth/callback"
+  graph_scopes:
+    - "User.Read"
+    - "GroupMember.Read.All"
+rbac:
+  group_role_map:
+    "00000000-0000-0000-0000-000000000000":
+      - "admin"
+  route_policies:
+    "/#/admin":
+      - "admin"
+  evaluation_mode: "any_of"
+  group_refresh_ttl_minutes: 60
+session:
+  cookie_name: "auth_session"
+  same_site: "strict"
+  secure: true
+  http_only: true
+  signing_secret: "change-me-signing-secret"
+  max_age_minutes: 60
+csrf:
+  enabled: true
+  secret: "change-me-csrf-secret"
+security:
+  require_pkce: true
+  validate_state_nonce: true
+  enforce_issuer_aud: true
+  token_at_rest_encryption: true
+  token_encryption_secret: "change-me-fernet-key"
+sqlite:
+  db_path: "./data/app.db"
+  busy_timeout_ms: 5000
+  pragmas:
+    journal_mode: "WAL"
+    synchronous: "NORMAL"
+server:
+  base_url: "http://localhost:8000"
+  cors_allowed_origins:
+    - "http://localhost:3000"
+  log_level: "INFO"
+ui:
+  default_authenticated_route: "/#/home"
+  default_logged_out_route: "/#/login"
