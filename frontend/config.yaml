@@ -1,0 +1,25 @@
+tenant_id: "<TENANT-ID>"
+client_id: "<CLIENT-ID>"
+redirect_uri: "https://your-bff-host/#/"
+post_logout_redirect_uri: "https://your-bff-host/#/logged-out"
+scopes:
+  - "openid"
+  - "profile"
+  - "email"
+  - "offline_access"
+graph_scopes:
+  - "GroupMember.Read.All"
+rbac:
+  group_to_role:
+    business_user:
+      - "<MIM-GROUP-ID-1>"
+      - "<MIM-GROUP-ID-2>"
+    business_admin:
+      - "<MIM-GROUP-ID-ADMIN>"
+route_policies:
+  "/": ["business_user", "business_admin"]
+  "/docs": ["business_user", "business_admin"]
+  "/scenario": ["business_user", "business_admin"]
+  "/chat": ["business_user", "business_admin"]
+  "/task": ["business_user", "business_admin"]
+  "/dashboard": ["business_admin"]

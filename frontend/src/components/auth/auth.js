@@ -1,111 +1,75 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { Navigate, useLocation } from 'react-router-dom';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { request } from "./api_auth";
 
-import { apiFetch, getSession, logout as apiLogout, startLogin } from './api_auth';
+const CSRF_CONFIG = {
+  cookieName: "bff_csrf",
+  headerName: "x-csrf-token",
+};
 
-const AuthContext = createContext(undefined);
-
-const initialState = {
+const AuthContext = createContext({
   isLoading: true,
   isAuthenticated: false,
   user: null,
   roles: [],
-  expiresAt: null,
-  error: null,
-};
+  allowedRoutes: [],
+  refreshSession: async () => {},
+});
 
-export function AuthProvider({ children }) {
-  const [state, setState] = useState(initialState);
+const AuthProvider = ({ children }) => {
+  const [authState, setAuthState] = useState({
+    isLoading: true,
+    isAuthenticated: false,
+    user: null,
+    roles: [],
+    allowedRoutes: [],
+    expiresAt: null,
+    tokenExpiresAt: null,
+  });
 
-  const refreshSession = useCallback(async () => {
-    setState((prev) => ({ ...prev, isLoading: true, error: null }));
+  const loadSession = useCallback(async () => {
+    setAuthState((previous) => ({
+      ...previous,
+      isLoading: true,
+    }));
     try {
-      const session = await getSession();
-      setState({
+      const data = await request("/auth/session", { method: "GET" }, CSRF_CONFIG);
+      setAuthState({
         isLoading: false,
-        isAuthenticated: session.is_authenticated,
-        user: session.user,
-        roles: session.roles ?? [],
-        expiresAt: session.expires_at ? new Date(session.expires_at) : null,
-        error: null,
+        isAuthenticated: true,
+        user: data.user,
+        roles: data.roles || [],
+        allowedRoutes: data.allowed_routes || [],
+        expiresAt: data.expires_at,
+        tokenExpiresAt: data.token_expires_at,
       });
     } catch (error) {
-      setState({
-        ...initialState,
+      setAuthState({
         isLoading: false,
-        error,
+        isAuthenticated: false,
+        user: null,
+        roles: [],
+        allowedRoutes: [],
+        expiresAt: null,
+        tokenExpiresAt: null,
       });
     }
   }, []);
 
   useEffect(() => {
-    refreshSession();
-  }, [refreshSession]);
-
-  const login = useCallback(async () => {
-    const { authorization_url: authorizationUrl } = await startLogin();
-    window.location.assign(authorizationUrl);
-  }, []);
-
-  const logout = useCallback(async () => {
-    try {
-      const response = await apiLogout();
-      if (response.redirect_url) {
-        window.location.assign(response.redirect_url);
-        return;
-      }
-    } finally {
-      await refreshSession();
-    }
-    window.location.hash = '#/login';
-  }, [refreshSession]);
+    loadSession();
+  }, [loadSession]);
 
   const value = useMemo(
     () => ({
-      ...state,
-      login,
-      logout,
-      refreshSession,
-      apiFetch,
+      ...authState,
+      refreshSession: loadSession,
     }),
-    [state, login, logout, refreshSession]
+    [authState, loadSession],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
-}
+};
 
-export function useAuth() {
-  const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
-  return context;
-}
+const useAuth = () => useContext(AuthContext);
 
-function hasRequiredRoles(requiredRoles, userRoles) {
-  if (!requiredRoles || requiredRoles.length === 0) {
-    return true;
-  }
-  if (!userRoles || userRoles.length === 0) {
-    return false;
-  }
-  return requiredRoles.every((role) => userRoles.includes(role));
-}
-
-export function ProtectedRoute({ requiredRoles = [], fallback = null, children }) {
-  const { isLoading, isAuthenticated, roles } = useAuth();
-  const location = useLocation();
-
-  if (isLoading) {
-    return fallback ?? <div className="app-loading">Loading…</div>;
-  }
-  if (!isAuthenticated) {
-    return <Navigate to="/login" state={{ from: location }} replace />;
-  }
-  if (!hasRequiredRoles(requiredRoles, roles)) {
-    return fallback ?? <div className="app-access-denied">Access denied</div>;
-  }
-  return children;
-}
-
-export default AuthContext;
+export { AuthContext, AuthProvider, useAuth, CSRF_CONFIG };

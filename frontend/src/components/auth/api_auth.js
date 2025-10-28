@@ -1,73 +1,72 @@
-const API_BASE = process.env.REACT_APP_API_BASE ?? '';
-
-const defaultOptions = {
-  credentials: 'include',
-  headers: {
-    'Content-Type': 'application/json',
-  },
+const DEFAULT_HEADERS = {
+  Accept: "application/json",
 };
 
-async function parseJson(response) {
-  const text = await response.text();
-  return text ? JSON.parse(text) : {};
-}
-
-async function handleResponse(response) {
-  if (!response.ok) {
-    const payload = await parseJson(response).catch(() => ({}));
-    const error = new Error(payload.detail || response.statusText);
-    error.status = response.status;
-    error.payload = payload;
-    throw error;
+class ApiError extends Error {
+  constructor(message, status, body) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
   }
-  return parseJson(response);
 }
 
-export async function getSession() {
-  const response = await fetch(`${API_BASE}/auth/session`, {
-    ...defaultOptions,
-    method: 'GET',
-  });
-  return handleResponse(response);
-}
+const readCookie = (name) => {
+  const value = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${name}=`));
+  if (!value) {
+    return null;
+  }
+  return decodeURIComponent(value.split("=", 2)[1]);
+};
 
-export async function startLogin() {
-  const response = await fetch(`${API_BASE}/auth/login`, {
-    ...defaultOptions,
-    method: 'GET',
-  });
-  return handleResponse(response);
-}
+const withCsrf = (options = {}, csrfCookie = "bff_csrf", csrfHeader = "x-csrf-token") => {
+  const method = (options.method || "GET").toUpperCase();
+  if (["GET", "HEAD", "OPTIONS"].includes(method)) {
+    return options;
+  }
+  const token = readCookie(csrfCookie);
+  const headers = { ...(options.headers || {}) };
+  if (token) {
+    headers[csrfHeader] = token;
+  }
+  return { ...options, headers };
+};
 
-export async function logout() {
-  const response = await fetch(`${API_BASE}/auth/logout`, {
-    ...defaultOptions,
-    method: 'POST',
-    headers: {
-      ...defaultOptions.headers,
-      'X-CSRF-Token': getCsrfToken(),
-    },
-  });
-  return handleResponse(response);
-}
-
-export async function apiFetch(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...defaultOptions,
+const request = async (path, options = {}, csrfConfig = {}) => {
+  const config = {
+    credentials: "include",
     ...options,
-    headers: {
-      ...defaultOptions.headers,
-      ...options.headers,
-      ...(options.method && options.method !== 'GET'
-        ? { 'X-CSRF-Token': getCsrfToken() }
-        : {}),
-    },
-    credentials: 'include',
-  });
-  return handleResponse(response);
-}
+    headers: { ...DEFAULT_HEADERS, ...(options.headers || {}) },
+  };
+  if (config.body && typeof config.body === "object" && !(config.body instanceof FormData)) {
+    if (!config.headers["Content-Type"]) {
+      config.headers["Content-Type"] = "application/json";
+    }
+    config.body = JSON.stringify(config.body);
+  }
+  const { cookieName = "bff_csrf", headerName = "x-csrf-token" } = csrfConfig;
+  const finalConfig = withCsrf(config, cookieName, headerName);
 
-export function getCsrfToken() {
-  const match = document.cookie.match(/(?:^|; )csrf_token=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : undefined;
-}
+  const response = await fetch(path, finalConfig);
+  const text = await response.text();
+  const body = text ? safeJsonParse(text) : null;
+
+  if (!response.ok) {
+    throw new ApiError(body?.detail || "Request failed", response.status, body);
+  }
+
+  return body;
+};
+
+const safeJsonParse = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    return null;
+  }
+};
+
+export { request, ApiError, readCookie };

@@ -1,230 +1,296 @@
 
-⸻
 
-Goals (what this boilerplate guarantees)
-	•	Security first: React never sees tokens. All tokens live server-side in httpOnly, Secure cookies + server cache/DB.
-	•	BFF pattern: The FastAPI backend handles OAuth/OIDC, Graph access, RBAC calculation, and proxies downstream calls.
-	•	Simple files: Header.js, App.js, components/auth/{auth.js, api_auth.js, ProtectedRoute.js}, Login.js, LoggedOut.js.
-	•	HashRouter: No BrowserRouter. Works behind static hosting/CDN without server rewrites.
-	•	RBAC that scales: Easy mapping of AAD group IDs → app roles → permissions → route gates.
-	•	Background refresh: Silent, server-side refresh using refresh tokens; client just keeps a lightweight session.
-	•	SQLite (APSW): Minimal state, multi-user, durable token cache + audit trail.
-
-⸻
-
-Identity & Azure AD setup (minimal)
-	1.	App registration
-	•	client_id = your app’s Application (client) ID.
-	•	tenant_id = your directory ID.
-	•	Configure redirect URIs for backend: https://yourapp.com/auth/callback.
-	•	Add scopes: openid profile email offline_access.
-	•	Add Microsoft Graph delegated scopes you need (start with User.Read, GroupMember.Read.All).
-	•	Group claims: enable “Group Membership Claims” on the app. If group overage occurs, the token will include an overage indicator; the backend must call Graph as fallback.
-	•	Prefer certificate credentials over client secrets; store in a secure keystore (env var path + passphrase or HSM).
-	2.	RBAC source of truth
-	•	List the AAD group IDs that map to your app roles (e.g., admins, authors, readers).
-	•	Keep this mapping in backend config (YAML/env) so it’s redeploy-free to update.
+0) Goals & constraints (from you)
+	•	Inputs: client_id, tenant_id, redirect_uri, post_logout_redirect_uri, scopes (e.g., openid, profile, email, offline_access, Graph scopes like memberOf), MIM group IDs.
+	•	All pages are protected by default. ProtectedRoute is the single gate; LoggedOut and Login are public.
+	•	Use BFF: browser never sees access/refresh tokens; no localStorage; auth state via secure HttpOnly cookie.
+	•	RBAC via Microsoft: assign roles from MIM group IDs; no database to maintain.
+	•	HashRouter in React.
+	•	Config in config.yaml.
+	•	Simple file layout (no TSX, minimal components).
+	•	Background refresh done server-side.
+	•	Multi-user by default.
 
 ⸻
 
-High-level architecture (BFF)
-	•	React (HashRouter): Knows only “am I authenticated? what are my permissions?” via /auth/me. Never stores tokens.
-	•	FastAPI:
-	•	Performs Authorization Code + PKCE flow with Azure AD.
-	•	Stores tokens server-side (MSAL cache persisted in SQLite via APSW).
-	•	Issues a short-lived, httpOnly, SameSite=Lax, Secure session cookie to the browser.
-	•	Resolves RBAC (group → role → permissions) at login and caches with TTL; refreshes in the background.
-	•	Calls Graph on behalf of the user; applies rate-limit/backoff + caching.
-	•	Exposes a tiny auth surface: /auth/login, /auth/callback, /auth/me, /auth/refresh, /auth/logout, /auth/heartbeat.
+1) Microsoft / Entra setup (once)
+	1.	Register Web App (BFF)
+	•	Type: Web app (confidential client).
+	•	Redirect URIs: https://<your-bff>/auth/callback.
+	•	Front-channel logout URL: https://<your-bff>/auth/post-logout.
+	•	Enable ID tokens.
+	•	Add client secret or (preferably) a certificate.
+	•	API permissions (delegated): openid, profile, email, offline_access and the minimum Graph scopes for groups (e.g., GroupMember.Read.All or configure Group claims in the token; see §4 RBAC).
+	•	Grant admin consent.
+	2.	Group Claims (recommended)
+	•	In the app manifest, set groupMembershipClaims to SecurityGroup (or All) to receive groups claim in the id_token (handles many cases without hitting Graph).
+	•	If “overage” (too many groups) occurs, the token will include a special claim indicating you must call Graph once.
+
+You can either rely on group claims in the id_token or call Graph on login to fetch /me/transitiveMemberOf//getMemberObjects—pick one primary path and keep the other as fallback.
 
 ⸻
 
-Backend (FastAPI) design
+2) Repo layout & config
 
-Config (12-factor)
-	•	AUTHORITY: https://login.microsoftonline.com/{tenant_id}
-	•	CLIENT_ID
-	•	CLIENT_CRED: certificate (recommended) or secret
-	•	REDIRECT_URI: https://.../auth/callback
-	•	COOKIE_NAME: e.g., __Host_session
-	•	COOKIE_MAX_AGE: rolling (e.g., 20 min) + absolute (e.g., 8 hours)
-	•	GRAPH_SCOPES: User.Read GroupMember.Read.All
-	•	RBAC_MAPPINGS (env/YAML):
+/frontend
+  /src
+    /components
+      /auth
+        auth.js          # minimal client-side session helper (no tokens)
+        api_auth.js      # thin wrapper to hit BFF /auth/* and /api/*
+    Header.js
+    App.js
+    ProtectedRoute.js
+    LoggedOut.js
+    Login.js
+    Home.js, Docs.js, Scenario.js, Chat.js, Task.js, Dashboard.js (all of these goes into pages folder, for now just put some mock info)
+  config.yaml            # served at build or baked into bundle as static JSON
 
-groups_to_roles:
-  "<aad_group_admin_id>": ["admin"]
-  "<aad_group_author_id>": ["author"]
-  "<aad_group_reader_id>": ["reader"]
-roles_to_permissions:
-  admin: ["*"]
-  author: ["content:create", "content:update", "content:view"]
-  reader: ["content:view"]
+/backend
+  app.py                 # FastAPI entry, mounts routers, BFF proxy, security
+  /auth
+    routes.py            # /auth/login, /auth/callback, /auth/logout, /auth/session
+    ms_client.py         # MSAL client, token exchange/refresh helpers
+    sessions.py          # cookie/session management, CSRF, state/nonce
+    claims.py            # groups→roles mapping, allowed routes resolution
+  /api
+    routes.py            # your app APIs, all behind RBAC decorator/middleware
+  /bff
+    graph.py             # Graph client calls (memberOf, profile, etc.)
+  config.yaml            # same shape as frontend (or a superset)
+
+config.yaml (one source of truth)
+	•	tenant_id
+	•	client_id
+	•	authority_base: https://login.microsoftonline.com
+	•	redirect_uri, post_logout_redirect_uri
+	•	scopes:
+	•	openid, profile, email, offline_access
+	•	Graph delegated scopes: minimal needed for groups fallback (e.g., GroupMember.Read.All)
+	•	cookie: { name, domain, secure: true, samesite: "Lax"|"Strict", http_only: true, max_age_minutes }
+	•	csrf: { cookie_name, header_name }
+	•	rbac:
+	•	group_to_role:
+
+business_user:
+  - "<MIM-GROUP-ID-1>"
+  - "<MIM-GROUP-ID-2>"
+business_admin:
+  - "<MIM-GROUP-ID-ADMIN>"
 
 
-	•	CORS_ALLOWED_ORIGINS: exact list of your frontends
-	•	CSRF: enabled; double-submit cookie (X-CSRF-Token header)
+	•	route_policies:
 
-Data store (SQLite via APSW)
+"/scenario": ["business_user", "business_admin"]
+"/chat":     ["business_user", "business_admin"]
+"/task":     ["business_user", "business_admin"]
+"/dashboard":["business_admin"]
+"/docs":     ["business_user", "business_admin"]
+"/":         ["business_user", "business_admin"]
 
-Tables (concise):
-	•	users(oid PRIMARY KEY, upn, display_name, email, created_at, last_seen_at)
-	•	sessions(session_id PRIMARY KEY, oid, issued_at, last_seen_at, expires_at, user_agent_hash, ip_hash, is_active)
-	•	token_cache(oid, cache_json_encrypted, updated_at) — MSAL cache blob, envelope-encrypted
-	•	role_cache(oid, roles_json, permissions_json, updated_at, ttl_expires_at)
-	•	audit(event_id, ts, oid, session_id, action, meta_json)
-	•	csrf(session_id, csrf_token, issued_at, expires_at)
 
-DB settings: WAL mode; busy_timeout; pragmas for durability; per-request connection from a small pool; integrity check at boot.
+	•	session: { refresh_skew_seconds: 300, role_cache_ttl_seconds: 300 }
+	•	cors: { allowed_origins: ["https://your-spa-origin"] }
 
-Auth endpoints (shape & behavior)
-	•	GET /auth/login → starts AAD flow (server redirect).
-	•	GET /auth/callback → completes code+PKCE; stores MSAL tokens in token_cache; computes roles:
-	•	If group claims present in ID token and under limit → map directly.
-	•	Else call Graph /me/transitiveMemberOf to fetch group IDs; map to roles.
-	•	Create sessions row; set httpOnly+Secure cookie; set CSRF cookie.
-	•	GET /auth/me (requires session) → returns {authenticated, user:{displayName, email}, roles, permissions, exp, idleRemainingSec}
-	•	Uses role_cache; if stale or nearing TTL, background refresh roles.
-	•	POST /auth/refresh (requires session + CSRF header)
-	•	Uses refresh token (from MSAL cache) to renew access tokens if within N minutes of expiry; updates cache.
-	•	Returns new idleRemainingSec; no tokens leaked to client.
-	•	POST /auth/logout (requires session + CSRF)
-	•	Revokes session (server-side), clears cookies; optional sign-out redirect to AAD.
-	•	POST /auth/heartbeat (requires session + CSRF)
-	•	Touches last_seen_at, optionally triggers background refresh if tokens expire < 5 min.
+⸻
 
-Background refresh strategy
-	•	Lazy-proactive: On any call to /auth/me, /auth/heartbeat, or first protected API call, if token expiry < 5 min:
-	•	Kick a background task to call MSAL acquire_token_silent; update token_cache.
-	•	Refresh role_cache periodically (e.g., every 10–15 min) to reflect mid-session group changes.
-	•	Backoff Graph throttles (429) with jitter; cache successful memberOf results for a short TTL (5–10 min).
+3) Frontend (React, HashRouter) design
+
+Principles
+	•	No tokens in the browser.
+	•	No localStorage. Use in-memory React state only.
+	•	All auth state comes from /auth/session JSON + secure cookie set by the BFF.
+
+Key pieces
+	•	App.js
+	•	Wrap with HashRouter.
+	•	On initial mount, call GET /auth/session:
+	•	if 200: store {user: {name, email}, roles, allowed_routes, exp} in memory context.
+	•	if 401: mark isAuthenticated=false.
+	•	ProtectedRoute.js
+	•	On route mount, re-validate with /auth/session.
+	•	If 401, redirect to /#/login.
+	•	If 403 (known route but role not allowed), show a simple “Not Authorized” page.
+	•	Login.js
+	•	A button that calls POST /auth/login (BFF returns a 302 to Microsoft).
+	•	After the auth dance, backend redirects to your redirect_uri (e.g., /#/).
+	•	LoggedOut.js
+	•	Public page encouraging login.
+	•	Header.js
+	•	Shows app name, current user (if any), and a Logout button → POST /auth/logout (backend signs out + clears cookie).
+	•	components/auth/api_auth.js
+	•	Thin fetch wrapper sends credentials (cookies) and CSRF header (if method != GET).
+	•	Handles 401/403 to trigger redirect or toasts.
+	•	components/auth/auth.js
+	•	Minimal helpers to pull session from the context; no persistence.
+
+Routing
+	•	Use HashRouter so deep links work in static hosting (server needn’t rewrite).
+	•	All pages (Home, Docs, Scenario, Chat, Task, Dashboard) are wrapped by ProtectedRoute.
+
+UI behavior
+	•	“Everything is protected by default”: any page not explicitly whitelisted is guarded.
+	•	Hide/disable nav items in Header based on allowed_routes.
+
+⸻
+
+4) Backend (FastAPI) design
+
+BFF responsibilities
+	•	Owns the OAuth/OIDC flow (Authorization Code + PKCE).
+	•	Redeems code for tokens using MSAL (server-side).
+	•	Stores tokens server-side (preferred) or in encrypted, HttpOnly cookie (stateless mode).
+	•	Exposes only session shape to the SPA, never tokens.
+	•	Enforces RBAC on all /api/* and proxies any Graph calls on behalf of the user.
+
+Endpoints
+	•	POST /auth/login
+	•	Creates state + nonce + PKCE verifier.
+	•	Stores transient values in a short-lived, signed cookie.
+	•	302 to Microsoft authorize endpoint with scopes from config.yaml.
+	•	GET /auth/callback
+	•	Validates state + nonce.
+	•	Exchanges code for id_token, access_token, refresh_token.
+	•	Group resolution (pick strategy):
+	•	Preferred: read groups claim from id_token when present.
+	•	Fallback: one Graph call to fetch group IDs (/me/getMemberObjects or /me/transitiveMemberOf) and cache for role_cache_ttl_seconds.
+	•	Map group IDs → roles using rbac.group_to_role.
+	•	Compute allowed_routes using rbac.route_policies.
+	•	Create session:
+	•	Option A (recommended): server-side session store (in-memory with eviction; if you need multiple instances later, switch to Redis without changing the interface).
+	•	Option B (stateless): signed, encrypted cookie with minimal claims (sub, name, roles, allowed_routes, exp) and no access/refresh tokens inside; keep tokens server-side only.
+	•	Set HttpOnly, Secure, SameSite cookie. Redirect to post-login route (from config).
+	•	GET /auth/session
+	•	Returns { isAuthenticated, user:{name,email}, roles, allowed_routes, session_expiry }.
+	•	POST /auth/logout
+	•	Clears session cookie.
+	•	(Optionally) call Microsoft front-channel logout.
+	•	Redirect to post_logout_redirect_uri.
+	•	GET /api/...
+	•	All APIs protected by middleware:
+	•	Verify session cookie signature & expiry.
+	•	Enforce RBAC using route_policies.
+	•	If making Graph calls on user’s behalf, ensure access token valid; if expiring soon, refresh server-side before use.
+	•	(Optional) GET /auth/ping
+	•	Lightweight keep-alive that also lets backend proactively refresh nearing-expiry sessions.
+
+Token lifecycle (background refresh)
+	•	Keep access_token lifetime small; rely on refresh_token.
+	•	On each request, middleware checks token exp:
+	•	If < refresh_skew_seconds, refresh via MSAL silently using the stored refresh_token; rotate refresh token.
+	•	If refresh fails, clear session → 401.
+	•	If you want to keep users “warm” while idle, the SPA can call /auth/ping every ~5–10 minutes when focused; backend decides if refresh is needed. (No timers in the SPA for tokens themselves.)
 
 Security hardening
-	•	Cookies: Secure, httpOnly, SameSite=Lax, Path=/.
-	•	CSRF: double-submit cookie + X-CSRF-Token header on every state-changing call.
-	•	CORS: deny by default; allow exact origins; no *.
-	•	Headers: HSTS, frame-ancestors none, strict CSP (only your origins), Referrer-Policy.
-	•	PII: store minimal; hash IP/UA; log only OID/opaque IDs.
-	•	Rate-limit /auth/*.
-	•	Rotate COOKIE_SECRET/encryption keys with envelope-encryption versioning.
+	•	Cookies: Secure, HttpOnly, SameSite=Lax (or Strict if your flows permit).
+	•	CSRF: for state-changing POST/PUT/DELETE, require a CSRF header matching a server-issued CSRF cookie tied to the session.
+	•	Validate state & nonce on the OIDC flow.
+	•	CORS: only your SPA origin(s).
+	•	Content Security Policy (CSP) on SPA.
+	•	Strict input validation on all /api/*.
 
 ⸻
 
-Frontend (React, HashRouter) design
+5) RBAC with MIM groups (clean & fast)
 
-File layout (JS only; no TS/TSX)
+Primary approach (lowest latency):
+	•	Enable group claims in the id_token (app manifest groupMembershipClaims → SecurityGroup).
+	•	On callback, read id_token.claims.groups (or hasgroups → do one Graph call if overage).
+	•	Use rbac.group_to_role mapping from config.yaml to derive roles.
+	•	From roles, compute allowed_routes via rbac.route_policies and include these two arrays in the session object sent to the SPA.
 
-src/
-  App.js
-  Header.js
-  LoggedOut.js
-  Login.js
-  components/
-    auth/
-      auth.js            # AuthContext (state machine + bootstrap)
-      api_auth.js        # Thin BFF client (fetch wrappers)
-      ProtectedRoute.js  # Route guard with RBAC
-  routes.js              # Route manifest (path → component, requiredPermissions)
+Fallback approach (if no group claims)
+	•	Call Graph once per login to fetch group IDs (/me/transitiveMemberOf or /me/getMemberObjects). Cache for a short TTL (e.g., 5 min).
+	•	Never expose raw group IDs to the client; only roles and allowed_routes.
 
-Router
-	•	Use HashRouter.
-	•	Central route manifest (routes.js) objects like:
-	•	{ path: '#/dashboard', element: <Dashboard/>, requiredPermissions: ['content:view'] }
-	•	Public pages omit requiredPermissions.
-	•	ProtectedRoute wraps elements with requiredPermissions.
-
-Auth context (auth.js)
-
-State machine:
-	•	loading → authenticated | unauthenticated | error
-	•	user: {displayName, email}
-	•	roles, permissions
-	•	idleRemainingSec
-
-Bootstrap flow on app mount:
-	1.	Call /auth/me.
-	2.	If authenticated: true → populate context.
-	3.	Else stay unauthenticated (show LoggedOut or Login).
-
-Session keep-alive:
-	•	setInterval every e.g., 4 min → call /auth/heartbeat.
-	•	If server signals near expiry, it refreshes in background (client doesn’t handle tokens).
-
-Errors:
-	•	If /auth/me 401 → clear context → render LoggedOut.
-
-API client (api_auth.js)
-	•	Thin wrappers: getMe(), login(), logout(), heartbeat(), refresh().
-	•	Always include X-CSRF-Token from a non-httpOnly cookie or server-rendered meta tag.
-	•	No localStorage. Keep ephemeral UI state only in React memory.
-
-ProtectedRoute (ProtectedRoute.js)
-	•	If auth.loading → show lightweight spinner.
-	•	If unauthenticated → render <LoggedOut />.
-	•	If authenticated but missing any requiredPermissions → render “Not authorized”.
-	•	Else render children.
-
-Pages
-	•	Login.js → link/button calling /auth/login (server redirects to AAD).
-	•	LoggedOut.js → explanation + “Sign in” button.
-	•	Header.js → shows user name when authenticated + “Sign out” button (calls /auth/logout), and conditionally renders nav links based on permissions.
+No database promise kept
+	•	Sessions in memory (or signed cookie) + short TTL cache for groups.
+	•	If you ever scale to multiple replicas, switch to Redis for sessions transparently (still “no database” in your app domain).
 
 ⸻
 
-RBAC model (simple & extensible)
-	•	Groups → Roles: Config maps AAD group IDs to role names.
-	•	Roles → Permissions: Config maps roles to coarse permissions. Use '*' for admins.
-	•	Routes → Permissions: Each protected route declares requiredPermissions.
-	•	Computation: On login/refresh, backend resolves user’s roles from group membership and flattens into unique permission set, caches with TTL.
-
-Why this scales:
-	•	New feature? Add a permission string and annotate routes.
-	•	New team? Create AAD group, map to role(s) in config—no code changes.
-	•	Need per-feature flags? Add permission keys and gate components/buttons the same way.
+6) Page protection & route governance
+	•	Frontend:
+	•	ProtectedRoute asks /auth/session on navigation.
+	•	If isAuthenticated=false: redirect to /#/login.
+	•	If isAuthenticated=true but route not in allowed_routes: show 403 view.
+	•	Backend:
+	•	An RBAC decorator or middleware checks the requested path against route_policies. This is the source of truth; the SPA is just UX.
 
 ⸻
 
-Graph API usage (membership & profile)
-	•	Preferred: Use group claims directly from ID token when present and within limit.
-	•	Fallback: GET /me/transitiveMemberOf?$select=id to collect group IDs; cache for 5–10 minutes (per-user).
-	•	For profile UI: GET /me (display name, email).
-	•	Handle throttling (429) with exponential backoff + cap.
+7) BFF for Graph & your APIs
+	•	The SPA never calls Graph directly.
+	•	Your BFF (/bff/graph) calls Graph using the user’s delegated token (on-behalf-of) or the refreshed access_token from the user’s session.
+	•	Sanitize and downscope the data before returning to the SPA.
 
 ⸻
 
-Backend routes for your app data
-	•	All app APIs are behind the session cookie. React calls /api/... without Authorization headers.
-	•	Backend injects downstream tokens if needed (e.g., calling Graph) via MSAL on the server.
-	•	For your own APIs, apply an RBAC dependency that checks permissions attached to the session.
+8) Background refresh “the proper way”
+	•	Server-side only:
+	•	Maintain exp for both id_token (for claims freshness) and access_token.
+	•	Refresh opportunistically if time to expiry < refresh_skew_seconds.
+	•	Rotate refresh tokens (MSAL handles).
+	•	Do not rely on hidden iframes or SPA refresh hacks (they’re not needed in a BFF).
 
 ⸻
 
-Background refresh & expiry UX
-	•	Server schedules a token refresh when:
-	•	Access token exp < 5 min, or role_cache TTL expired.
-	•	Client only keeps the session warm with /auth/heartbeat.
-	•	If a refresh fails (user revoked), /auth/me will return 401 → React shows LoggedOut.
+9) Extensibility knobs
+	•	Add a new page/route:
+	1.	Implement page component + add ProtectedRoute.
+	2.	Add route to route_policies in config.yaml with allowed roles.
+	3.	Redeploy; no code change in RBAC logic.
+	•	Add a new role:
+	1.	Add a role name in group_to_role with MIM group IDs.
+	2.	Reference the role in route_policies.
+	•	Change Graph usage:
+Update scopes in config.yaml, grant admin consent once; BFF proxy stays unchanged.
 
 ⸻
 
-Operational checklist
-	•	Dev vs Prod:
-	•	Dev cookies may be non-Secure on http://localhost; in prod always Secure + HSTS.
-	•	CORS: allow http://localhost:3000 in dev; exact domains in prod.
-	•	Logging: structure logs; correlate session_id; avoid PII beyond OID.
-	•	Rate limits: /auth/* strict; /api/* moderate.
-	•	Secrets: env-injected; never in repo; rotate regularly.
-	•	DB: SQLite WAL; daily VACUUM; file permissions restricted to app user.
+10) Minimal user flows (text sequence)
+
+Login
+	1.	SPA → POST /auth/login
+	2.	BFF → Microsoft authorize (PKCE, state, nonce)
+	3.	Microsoft → GET /auth/callback?code=...&state=...
+	4.	BFF validates; redeems code → tokens; resolve groups→roles; set cookie; 302 to /#/
+	5.	SPA mounts → GET /auth/session → render protected UI.
+
+API Call
+	1.	SPA → GET /api/scenario (with cookie)
+	2.	BFF checks session & RBAC; if token near expiry, refresh; call service; return data.
+
+Logout
+	1.	SPA → POST /auth/logout
+	2.	BFF clears cookie; calls Microsoft logout; 302 to post_logout_redirect_uri.
 
 ⸻
 
-First-run playbook
-	1.	Create Azure AD app, configure redirect URI, scopes, group claims. Collect client_id, tenant_id, credential.
-	2.	Fill backend config (authority, client_id, credential, redirect, RBAC mappings).
-	3.	Initialize SQLite schema (tables above). Enable WAL.
-	4.	Start FastAPI. Verify /internal/health.
-	5.	Run React with HashRouter. On boot, it will call /auth/me:
-	•	If 200/authenticated → you see your name in Header.
-	•	If 401 → press “Sign in” → AAD → back to app.
-	6.	Test RBAC by adding/removing your user from mapped AAD groups; confirm route gating updates after role TTL or manual logout/login.
+11) What goes in each file (at a glance, still no code)
+
+Frontend
+	•	App.js: HashRouter, initial /auth/session fetch, AuthContext provider, routes.
+	•	ProtectedRoute.js: gate based on /auth/session + allowed_routes.
+	•	Header.js: current user display; Login/Logout buttons.
+	•	Login.js: single “Sign in with Microsoft” button → /auth/login.
+	•	LoggedOut.js: public page for unauthenticated users.
+	•	components/auth/api_auth.js: fetch wrapper (credentials included, CSRF header on write methods).
+	•	components/auth/auth.js: tiny context helpers, no persistence.
+
+Backend
+	•	auth/routes.py: /auth/login, /auth/callback, /auth/logout, /auth/session.
+	•	auth/ms_client.py: MSAL client, token redeem/refresh utilities.
+	•	auth/sessions.py: cookie signing, state/nonce, CSRF, session encode/decode.
+	•	auth/claims.py: read group claims / fallback Graph call; map to roles; compute allowed routes.
+	•	bff/graph.py: safe wrappers to call Graph; minimal scopes.
+	•	api/routes.py: your business APIs; all pass through RBAC middleware.
+	•	app.py: wire it all up; CORS; middlewares (RBAC, CSRF, refresh-on-edge); config loader.
 
 ⸻
+
+12) Defaults to set (so you don’t revisit later)
+	•	Cookie: Secure, HttpOnly, SameSite=Lax, path /, rotation on login, shortish max-age (e.g., 8–12h).
+	•	Session refresh skew: 5 minutes.
+	•	Group cache TTL: 5 minutes (keeps RBAC snappy, while reflecting changes reasonably fast).
+	•	SPA session poll: only on route change or periodic “ping” when active tab.
